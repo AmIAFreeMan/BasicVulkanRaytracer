@@ -1,0 +1,329 @@
+#version 450
+
+// Define compute shader workgroup size (16x16 threads per thread group)
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output image binding where the final raytraced frame is stored
+layout(rgba8, binding = 0, set = 0) uniform image2D resultImage;
+
+/**
+ * Custom 3-component floating-point vector structure used for positions, 
+ * directions, and RGB colors.
+ */
+struct Vector3 {
+    float x, y, z;
+};
+
+/**
+ * Defines a geometric object within the scene.
+ * type: 0 = Plane, 1 = Sphere, 2 = Cone, 3 = Box
+ * materialType: 0 = Matte, 1 = Metal
+ */
+struct SceneObject {
+    int type;          
+    Vector3 position;  
+    Vector3 color;     
+    float scale;       
+    int materialType;  
+    float roughness;   
+};
+
+/**
+ * Uniform buffer layout matching the CPU-side VulkanBuffer.cpp GPUSceneData.
+ * Holds scene objects, total count, camera rotation angles, and camera position.
+ */
+layout(std140, binding = 1, set = 0) readonly buffer SceneBuffer {
+    SceneObject objects[10];
+    int objectCount;
+    float cameraYaw;
+    float cameraPitch;
+    Vector3 cameraPos;
+} scene;
+
+/**
+ * Represents a ray with an origin point and a direction vector.
+ */
+struct Ray {
+    Vector3 origin;
+    Vector3 direction;
+};
+
+// ============================================================================
+// --- INTERSECTION FUNCTIONS ---
+// ============================================================================
+
+/**
+ * Computes ray intersection with an infinite horizontal plane.
+ * @param ray The ray being cast.
+ * @param planeY The Y-coordinate height of the plane.
+ * @param t Output parameter for the intersection distance.
+ * @return True if a valid intersection occurs ahead of the ray origin.
+ */
+bool intersectPlane(Ray ray, float planeY, out float t) {
+    if (abs(ray.direction.y) < 0.0001) return false;
+    t = (planeY - ray.origin.y) / ray.direction.y;
+    return t > 0.001;
+}
+
+/**
+ * Computes ray intersection with a sphere using the quadratic formula.
+ * @param ray The ray being cast.
+ * @param center Center position of the sphere.
+ * @param radius Radius of the sphere.
+ * @param t Output parameter for the closest valid intersection distance.
+ * @return True if the ray intersects the sphere.
+ */
+bool intersectSphere(Ray ray, Vector3 center, float radius, out float t) {
+    Vector3 oc = { ray.origin.x - center.x, ray.origin.y - center.y, ray.origin.z - center.z };
+    float b = 2.0 * (oc.x * ray.direction.x + oc.y * ray.direction.y + oc.z * ray.direction.z);
+    float c = (oc.x * oc.x + oc.y * oc.y + oc.z * oc.z) - radius * radius;
+    float discriminant = b * b - 4.0 * c;
+    if (discriminant < 0.0) return false;
+    t = (-b - sqrt(discriminant)) / 2.0;
+    return t > 0.001;
+}
+
+/**
+ * Computes ray intersection with a cone, checking bounds along the height axis.
+ * @param ray The ray being cast.
+ * @param center Base center position of the cone.
+ * @param scale Used to determine height and radius.
+ * @param t Output parameter for intersection distance.
+ * @return True if the ray hits the finite cone volume.
+ */
+bool intersectCone(Ray ray, Vector3 center, float scale, out float t) {
+    Vector3 oc = { ray.origin.x - center.x, ray.origin.y - center.y, ray.origin.z - center.z };
+    float height = scale;
+    float radius = scale * 0.5;
+    float k = radius / height;
+    k = k * k;
+
+    float a = ray.direction.x * ray.direction.x + ray.direction.z * ray.direction.z - k * ray.direction.y * ray.direction.y;
+    float b = 2.0 * (oc.x * ray.direction.x + oc.z * ray.direction.z + k * (height - oc.y) * ray.direction.y);
+    float c = oc.x * oc.x + oc.z * oc.z - k * (height - oc.y) * (height - oc.y);
+
+    float discriminant = b * b - 4.0 * a * c;
+    if (discriminant < 0.0) return false;
+
+    float sqrtDisc = sqrt(discriminant);
+    float t1 = (-b - sqrtDisc) / (2.0 * a);
+    float t2 = (-b + sqrtDisc) / (2.0 * a);
+
+    float tClosest = 10000.0;
+    bool hit = false;
+
+    // Validate first intersection point against height bounds
+    if (t1 > 0.001) {
+        Vector3 hitPoint = Vector3(ray.origin.x + ray.direction.x * t1, ray.origin.y + ray.direction.y * t1, ray.origin.z + ray.direction.z * t1);
+        float localY = hitPoint.y - center.y;
+        if (localY >= 0.0 && localY <= height) {
+            tClosest = t1;
+            hit = true;
+        }
+    }
+    // Validate second intersection point against height bounds
+    if (t2 > 0.001 && (!hit || t2 < tClosest)) {
+        Vector3 hitPoint = Vector3(ray.origin.x + ray.direction.x * t2, ray.origin.y + ray.direction.y * t2, ray.origin.z + ray.direction.z * t2);
+        float localY = hitPoint.y - center.y;
+        if (localY >= 0.0 && localY <= height) {
+            tClosest = t2;
+            hit = true;
+        }
+    }
+
+    if (hit) {
+        t = tClosest;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Computes ray intersection with an axis-aligned box using the slab method.
+ * @param ray The ray being cast.
+ * @param center Center position of the box.
+ * @param size Half-extent size of the box along each axis.
+ * @param t Output parameter for intersection distance.
+ * @return True if a valid intersection occurs.
+ */
+bool intersectBox(Ray ray, Vector3 center, float size, out float t) {
+    Vector3 bmin = Vector3(center.x - size, center.y - size, center.z - size);
+    Vector3 bmax = Vector3(center.x + size, center.y + size, center.z + size);
+
+    float t1 = (bmin.x - ray.origin.x) / ray.direction.x;
+    float t2 = (bmax.x - ray.origin.x) / ray.direction.x;
+    float tmin = min(t1, t2);
+    float tmax = max(t1, t2);
+
+    float t3 = (bmin.y - ray.origin.y) / ray.direction.y;
+    float t4 = (bmax.y - ray.origin.y) / ray.direction.y;
+    tmin = max(tmin, min(t3, t4));
+    tmax = min(tmax, max(t3, t4));
+
+    float t5 = (bmin.z - ray.origin.z) / ray.direction.z;
+    float t6 = (bmax.z - ray.origin.z) / ray.direction.z;
+    tmin = max(tmin, min(t5, t6));
+    tmax = min(tmax, max(t5, t6));
+
+    if (tmax < tmin || tmax < 0.001) return false;
+    t = tmin >= 0.001 ? tmin : tmax;
+    return t > 0.001;
+}
+
+// ============================================================================
+// --- SURFACE NORMAL CALCULATIONS ---
+// ============================================================================
+
+/**
+ * Calculates the exact outward surface normal at a given hit point for an object.
+ * @param obj The intersected scene object.
+ * @param hitPoint The 3D coordinate where the ray hit the surface.
+ * @return Normalized Vector3 representing the surface normal.
+ */
+Vector3 getNormal(SceneObject obj, Vector3 hitPoint) {
+    if (obj.type == 0) {
+        return Vector3(0.0, 1.0, 0.0); // Plane normal points straight up
+    } 
+    else if (obj.type == 1) {
+        // Sphere normal: exact radial vector from center
+        float len = sqrt(pow(hitPoint.x - obj.position.x, 2.0) + 
+                         pow(hitPoint.y - obj.position.y, 2.0) + 
+                         pow(hitPoint.z - obj.position.z, 2.0));
+        return Vector3((hitPoint.x - obj.position.x) / len, 
+                       (hitPoint.y - obj.position.y) / len, 
+                       (hitPoint.z - obj.position.z) / len);
+    } 
+    else if (obj.type == 3) {
+        // Box / Cube normal calculation based on face bounds using a bias check
+        Vector3 center = obj.position;
+        float size = obj.scale;
+        Vector3 p = Vector3(hitPoint.x - center.x, hitPoint.y - center.y, hitPoint.z - center.z);
+        float bias = 0.001;
+        
+        if (abs(p.x - size) < bias) return Vector3(1.0, 0.0, 0.0);
+        if (abs(p.x + size) < bias) return Vector3(-1.0, 0.0, 0.0);
+        if (abs(p.y - size) < bias) return Vector3(0.0, 1.0, 0.0);
+        if (abs(p.y + size) < bias) return Vector3(0.0, -1.0, 0.0);
+        if (abs(p.z - size) < bias) return Vector3(0.0, 0.0, 1.0);
+        if (abs(p.z + size) < bias) return Vector3(0.0, 0.0, -1.0);
+        return Vector3(0.0, 1.0, 0.0);
+    } 
+    else {
+        // Cone fallback normal
+        return Vector3(0.0, 1.0, 0.0);
+    }
+}
+
+// ============================================================================
+// --- MAIN COMPUTE PIPELINE ---
+// ============================================================================
+
+void main() {
+    // Determine global pixel coordinates and output image dimensions
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(resultImage);
+
+    // Discard threads that fall outside the image boundaries
+    if (pixelCoords.x >= dims.x || pixelCoords.y >= dims.y) return;
+
+    // Map pixel coordinates to Normalized Device Coordinates (NDC) ranging from -1 to 1
+    float u = (float(pixelCoords.x) / float(dims.x)) * 2.0 - 1.0;
+    float v = (float(pixelCoords.y) / float(dims.y)) * 2.0 - 1.0;
+    v = -v; // Invert V coordinate to match standard screen space
+
+    // Initialize primary ray origin from the camera position
+    Ray ray;
+    ray.origin = scene.cameraPos; 
+    
+    // Initial ray direction in camera space looking down the positive Z axis
+    Vector3 dir = Vector3(u, v, 1.0);
+
+    // Apply camera Yaw rotation around the Y axis
+    float cosYaw = cos(scene.cameraYaw);
+    float sinYaw = sin(scene.cameraYaw);
+    float x1 = dir.x * cosYaw + dir.z * sinYaw;
+    float z1 = -dir.x * sinYaw + dir.z * cosYaw;
+
+    // Apply camera Pitch rotation around the X axis
+    float cosPitch = cos(scene.cameraPitch);
+    float sinPitch = sin(scene.cameraPitch);
+    float y2 = dir.y * cosPitch - z1 * sinPitch;
+    float z2 = dir.y * sinPitch + z1 * cosPitch;
+
+    // Normalize the final rotated ray direction vector
+    float dirLen = sqrt(x1 * x1 + y2 * y2 + z2 * z2);
+    ray.direction = Vector3(x1 / dirLen, y2 / dirLen, z2 / dirLen);
+
+    // Default background color (dark blue-gray tint)
+    Vector3 pixelColor = Vector3(0.1f, 0.1f, 0.15f);
+    float closestT = 10000.0;
+    SceneObject hitObject;
+    bool hasHit = false;
+
+    // Loop through all objects in the scene buffer to find the closest intersection
+    for (int i = 0; i < scene.objectCount; i++) {
+        SceneObject obj = scene.objects[i];
+        float t = 0.0;
+        bool hit = false;
+
+        // Perform ray-object intersection based on the object type
+        if (obj.type == 0) hit = intersectPlane(ray, obj.position.y, t);
+        else if (obj.type == 1) hit = intersectSphere(ray, obj.position, obj.scale, t);
+        else if (obj.type == 2) hit = intersectCone(ray, obj.position, obj.scale, t);
+        else if (obj.type == 3) hit = intersectBox(ray, obj.position, obj.scale, t);
+
+        // Track the closest valid hit object
+        if (hit && t < closestT) {
+            closestT = t;
+            hitObject = obj;
+            hasHit = true;
+        }
+    }
+
+    // Shade the pixel if an object was hit along the ray path
+    if (hasHit) {
+        Vector3 hitPoint = Vector3(ray.origin.x + ray.direction.x * closestT,
+                                   ray.origin.y + ray.direction.y * closestT,
+                                   ray.origin.z + ray.direction.z * closestT);
+        Vector3 normal = getNormal(hitObject, hitPoint);
+
+        // Material Type 0: Matte Surface (Diffuse + Ambient lighting)
+        if (hitObject.materialType == 0) {
+            Vector3 lightDir = Vector3(0.577, 0.577, -0.577); // Directional light vector
+            float diff = max(0.0, normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z);
+            float ambient = 0.2;
+            float lighting = diff + ambient;
+            
+            pixelColor = Vector3(hitObject.color.x * lighting, 
+                                 hitObject.color.y * lighting, 
+                                 hitObject.color.z * lighting);
+        } 
+        // Material Type 1: Shiny Metal Reflection (Sky-ground environment gradient)
+        else if (hitObject.materialType == 1) {
+            vec3 normVec = vec3(normal.x, normal.y, normal.z);
+            vec3 rayDirVec = vec3(ray.direction.x, ray.direction.y, ray.direction.z);
+            vec3 reflectDir = reflect(rayDirVec, normVec); // Calculate reflection vector
+            
+            float skyFactor = clamp(reflectDir.y * 0.5 + 0.5, 0.0, 1.0);
+            
+            // Define environment colors (Sky vs Ground)
+            float skyR = 0.5; float skyG = 0.7; float skyB = 1.0;
+            float groundR = 0.15; float groundG = 0.15; float groundB = 0.15;
+            
+            // Blend environment colors based on reflection vector direction
+            float envR = mix(groundR, skyR, skyFactor);
+            float envG = mix(groundG, skyG, skyFactor);
+            float envB = mix(groundB, skyB, skyFactor);
+            
+            pixelColor = Vector3(
+                envR * (0.3 + 0.7 * hitObject.color.x),
+                envG * (0.3 + 0.7 * hitObject.color.y),
+                envB * (0.3 + 0.7 * hitObject.color.z)
+            );
+        }
+    }
+
+    // Write final computed color into the target output image storage
+    vec4 finalColor = vec4(pixelColor.x, pixelColor.y, pixelColor.z, 1.0);
+    imageStore(resultImage, pixelCoords, finalColor);
+}
