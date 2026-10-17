@@ -13,7 +13,6 @@ Key Features:
 - GPU-Side Raytracing: Real-time fragment evaluation inside `raytrace.comp`.
 - Modular Architecture: Clean separation of windowing, Vulkan core logic, scene management, and input.
 - Interactive 3D Camera: Mouse click-and-drag rotation (Yaw/Pitch) and keyboard movement (WASD/Arrows).
-- Dynamic Scene Loading: SDL2-powered drag-and-drop support to instantly add 3D object files into the active scene buffer.
 
 
 2. PROJECT STRUCTURE & FILE BREAKDOWN
