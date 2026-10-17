@@ -1,3 +1,0 @@
-/home/none/Desktop/cppProjects/Raytracer/build/CMakeFiles/Raytracer.dir
-/home/none/Desktop/cppProjects/Raytracer/build/CMakeFiles/edit_cache.dir
-/home/none/Desktop/cppProjects/Raytracer/build/CMakeFiles/rebuild_cache.dir
